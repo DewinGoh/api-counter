@@ -3,53 +3,106 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"log"
 	"net/http"
 	"net/url"
+	"runtime"
 	"time"
 )
 
+// Payload is
 type Payload struct {
 	testID string
 }
 
+// ReqInfo is
+type ReqInfo struct {
+	srv     *string
+	payload url.Values
+}
+
+// Response is
+type Response struct {
+	*http.Response
+	err error
+}
+
+// Dispatcher
+func dispatcher(reqChan chan *ReqInfo, numCalls *int, srv *string, payload url.Values) {
+	defer close(reqChan)
+	reqInfo := &ReqInfo{srv, payload}
+	for i := 0; i < *numCalls; i++ {
+		reqChan <- reqInfo
+	}
+}
+
+// Worker Pool
+func workerPool(reqChan chan *ReqInfo, respChan chan Response, numWorkers int) {
+	c := http.Client{
+		Timeout:   time.Duration(5) * time.Second,
+		Transport: &http.Transport{MaxConnsPerHost: 50},
+	}
+	for i := 0; i < numWorkers; i++ {
+		go worker(c, reqChan, respChan)
+	}
+}
+
+// Worker
+func worker(c http.Client, reqChan chan *ReqInfo, respChan chan Response) {
+	for req := range reqChan {
+		resp, err := c.PostForm(*req.srv, req.payload)
+		r := Response{resp, err}
+		respChan <- r
+	}
+}
+
+// Consumer
+func consumer(respChan chan Response, numCalls int) {
+	var conns = 0
+	var counter = 0
+	for conns < numCalls {
+		select {
+		case r, ok := <-respChan:
+			if ok {
+				if r.err != nil {
+					log.Println(r.err)
+				} else {
+					if r.StatusCode == 200 {
+						counter++
+					}
+				}
+				conns++
+			}
+		}
+	}
+	fmt.Printf("Total 200 OK responses: %d\n", counter)
+}
+
 func main() {
 	srv := flag.String("server", "", "Server address to call")
-	// numReq := flag.Int("numReq", 100, "Number of API calls to make per second")
+	numWorkers := flag.Int("numWorkers", 10, "Number of worker processes")
+	numCalls := flag.Int("numCalls", 1000, "Number of API calls to be made")
 	testID := flag.String("testID", "test-api", "Test ID that will be the key on Redis")
 	flag.Parse()
 
-	c := http.Client{Timeout: time.Duration(1) * time.Second}
-	// payload, _ := json.Marshal(Payload{testID: *testID})
-	// var payload = fmt.Sprintf("testID=%s", testID)
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	reqChan := make(chan *ReqInfo)
+	respChan := make(chan Response)
+
 	var payload = url.Values{
 		"testID": {*testID},
 	}
 
-	var counter = 0
-
-	// var timeInterval = 1.0 / float64(*numReq)
-	for i := 0; i < 100; i++ {
-		resp, err := c.PostForm(*srv, payload)
-		if err != nil {
-			fmt.Printf("Error %s", err)
-			return
-		}
-		if resp.StatusCode == 200 {
-			counter++
-		}
-		defer resp.Body.Close()
-		time.Sleep(time.Duration(1) * time.Millisecond)
-	}
-	fmt.Printf("Total 200 OK responses: %d\n", counter)
-
-	resp, err := c.Get(*srv + "?" + payload.Encode())
+	start := time.Now()
+	go dispatcher(reqChan, numCalls, srv, payload)
+	go workerPool(reqChan, respChan, *numWorkers)
+	consumer(respChan, *numCalls)
+	took := time.Since(start)
+	ns := took.Nanoseconds()
+	av := ns / int64(*numCalls)
+	average, err := time.ParseDuration(fmt.Sprintf("%d", av) + "ns")
 	if err != nil {
-		fmt.Printf("Error %s", err)
-		return
+		log.Println(err)
 	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	defer resp.Body.Close()
-	fmt.Printf("Redis API count: %s\n", body)
+	fmt.Printf("Connections:\t%d\nConcurrent:\t%d\nTotal time:\t%s\nAverage time:\t%s\n", *numCalls, *numWorkers, took, average)
 }
